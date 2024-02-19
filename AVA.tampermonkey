@@ -1,0 +1,842 @@
+// ==UserScript==
+// @name         AVA
+// @namespace    qwickset.com/
+// @version      2.0
+// @description  AVA - Amazin' Vine Assistant
+// @author       You
+// @match        https://*.amazon.com/vine/vine-items*
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=amazon.com
+// @require http://code.jquery.com/jquery-latest.js
+// @require https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js
+// @require https://code.jquery.com/ui/1.12.1/jquery-ui.js
+// @grant GM_setValue
+// @grant GM_getValue
+// ==/UserScript==
+/*globals $:false */
+
+/*
+    Bouncy scrollbar unavailable research:
+       - GrapevineVoicePortalAssets.js: 719
+                          Q(document).delegate(".vvp-details-btn", "click", function(a) {
+                            a.preventDefault();
+                            var b = a.target.dataset;
+                            a = b.recommendationId;
+                            var e = b.recommendationType
+                              , g = b.asin;
+                            b = b.isParentAsin;
+                            c.show();
+                            Sb(a, e, g, JSON.parse(b))
+                        })
+                        .....
+                        // e=true for flavor/variations dropdown, false if not
+                        e ? Xc(a).then(function(a) {
+                            a = a.result.variations;
+                            if (!a.length)
+                                throw Error("Parent asin has no variations");
+                            zc.trigger("vvp:dropdown:variation:setup", a)
+                        }).catch(function(a) {
+                            console.error("Unable to get variations or no variations: ", a);
+                            Q(la.ERROR_ALERT).show();
+                            Q(la.SPINNER).hide()
+                        }) : Dd(a, c)*/
+class StorageItem{
+    key;
+    parentKey;
+    constructor(parentKey,key){
+        this.parentKey=parentKey;
+        this.key=key;
+    }
+    get data(){
+        var storageData = new Storage(this.parentKey);
+        return storageData.getItem(this.key);
+    }
+    isStored(){
+        return this.data;
+    }
+    save(){
+        var storage = new Storage(this.storageKey);
+        storage.upsertItem(this);
+    }
+}
+class Storage{
+    key;
+    constructor(storageKey){
+        this.key=storageKey;
+        if (!GM_getValue(storageKey)) this.init();
+    }
+    init(){
+        GM_setValue(this.key,[]);
+    }
+    get data(){
+        return GM_getValue(this.key)||[];
+    }
+    save(data){
+        GM_setValue(this.key,data);
+    }
+    itemIndex(key){
+        var foundIndex = this.data.findIndex(x=>{if (x.key===key) {return true;}});
+        if (foundIndex<0) return -1;
+        return foundIndex;
+    }
+    containsItem(key){
+        if (!this.data) return false;
+        return (this.itemIndex>=0);
+    }
+    getItem(key){
+        var foundIndex=this.itemIndex(key);
+        if (foundIndex<0) return;
+        var gotItem= this.data[foundIndex];
+        return gotItem;
+    }
+    upsertItem(obj){
+        var foundIndex=this.itemIndex(obj.key);
+        var data = this.data;
+        if (foundIndex<0){
+            data.push(obj);
+            this.save(data);
+        } else {
+            data[foundIndex]=obj;
+            this.save(data);
+        }
+    }
+}
+class StorageHelper{
+    static validQueues=[
+        {value:"potluck",alias:"RFY"},
+        {value:"last-chance",alias:"AFA"},
+        {value:"encore",alias:"AI"}
+    ];
+    static getQueryStorage(){
+        return new QueryStorage();
+    }
+    static getProductStorage(){
+        return new ProductStorage();
+    }
+    static initAll(){
+        this.getQueryStorage().init();
+        this.getProductStorage().init();
+    }
+    static get currentQueryKey(){
+        var href=document.location.href;
+        if (href && href.toLowerCase().indexOf("queue=")===-1 && href.toLowerCase().indexOf("search=")===-1){
+            let element = $('#vvp-items-button-container').eq(0);
+            if (element) Util.log('util',`found element 1.${element.html()}`);
+            element=element.children('span[aria-checked="true"]');
+            if (element) Util.log('util',`found element 2. ${element.html()}`);
+            element=element.find('.a-button-text');
+            if (element) Util.log('util',`found element 3. ${element.attr('href')}`);
+            element=$('#vvp-items-button-container').eq(0).children('span[aria-checked="true"]').find('.a-button-text');
+            if (element) Util.log('util',`found element 4. ${element.attr('href')}`);
+            href=$('#vvp-items-button-container').eq(0).children('span[aria-checked="true"]').find('.a-button-text').attr('href');
+            //Util.log('util',$('.vvp-items-button-container span[aria-checked="true"] .a-button-text').attr('href'));
+        }
+        var hrefParts = href.split("?");
+        if (hrefParts.length<2) return;
+        var qsParts = hrefParts[1].split("=");
+        if (qsParts.length<2) return;
+
+        return `${qsParts[0]}|${qsParts[1].split('&')[0]}`;
+    }
+    static getProduct(asin){
+        var productStorage = new ProductStorage(asin);
+        var product = productStorage.getItem(asin);
+        return product;
+    }
+    static recordProduct(asin){
+        var currentQueryKey = StorageHelper.currentQueryKey;
+        var queryStorage = new QueryStorage(currentQueryKey);
+        var query = queryStorage.getItem(currentQueryKey);
+        if (!query) query = new Query(currentQueryKey);
+        query.recordASIN(asin);
+        queryStorage.upsertItem(query);
+
+        var productStorage = new ProductStorage(asin);
+        var product = productStorage.getItem(asin);
+        if (!product){
+            product = new Product(asin);
+            product.isNew=true;
+        } else {
+            product.isNew=false
+        }
+        product.recordQuery(currentQueryKey);
+        productStorage.upsertItem(product);
+        return product;
+    }
+}
+class QueryStorageItem extends StorageItem{
+    constructor(queryKey){
+        super(queryKey);
+    }
+    get name(){
+        return this.key;
+    }
+    get query(){
+        return this.data;
+    }
+}
+class QueryStorage extends Storage{
+    constructor(){
+        super("queries");
+    }
+    getItem(queryName){
+        var query = super.getItem(queryName);
+        if (!query) return;
+        return new Query(queryName,query);
+    }
+}
+class ProductStorageItem extends StorageItem{
+    constructor(asin){
+        super(asin);
+    }
+    get asin(){
+        return this.key;
+    }
+    get product(){
+        return this.data;
+    }
+}
+class ProductStorage extends Storage{
+    constructor(){
+        super("products");
+    }
+    getItem(asin){
+        var product = super.getItem(asin);
+        if (!product) return;
+        var newProduct
+        return new Product(asin,product);
+    }
+}
+class Atomic{
+    key;
+    constructor(key){
+        this.key=key;
+    }
+}
+class Product extends Atomic{
+    price;
+    lastSeen;
+    queries=[];
+    element;
+    isNew;
+    constructor(key,obj=null){
+        super(key);
+        if (obj) {
+            Object.assign(this, obj);
+            this.isNew=false;
+        }else{
+            this.isNew=true;
+        }
+    }
+    getASINElement(){
+        const element= $(`[data-asin='${this.key}']`);
+        Util.log('product',`getASINElement() = ${(element?'exists':'undefined')}`);
+        return element;
+    }
+    getElement(){
+        const element= this.getASINElement().closest('.vvp-item-tile').eq(0);
+        Util.log('product',`getElement() = ${(element?'exists':'undefined')}`);
+        return element;
+    }
+    getButton(){
+        const element= this.getASINElement().closest('.vvp-details-btn').eq(0);
+        Util.log('product',`getButton() = ${(element?'exists':'undefined')}`);
+        return element;
+    }
+    get asin(){
+        return this.key;
+    }
+    getButtonText(){
+        this.setButtonTextColor();
+        if(this.inMultipleQueries())
+        {
+            var queues=[];
+            StorageHelper.validQueues.forEach(queue=>{if (this.queries.indexOf(`queue|${queue.value}`)>=0) queues.push(queue.alias);});
+            if (queues.length==0){
+                return 'Multiple';
+            } else {
+                return queues.join('|');
+            }
+        } else if (!this.isNew){
+            return 'Visited!';
+        }
+        return;
+    }
+    setButtonTextColor(){
+        const button=this.getButton();
+        Util.log('product',`button.css('background-color')=${button.css('background-color')}`);
+        Util.log('product',`button.css('color')=${button.find('span').eq(0).css('color')} (before)`);
+        const currentColor=button.css('backgroundColor');
+        const color = Util.getContrastYIQ(currentColor);
+        Util.log('product',`got color = ${color}`);
+        button.find('span').eq(0).css('color',`${color}!important`);
+        Util.log('product',`button.css('color')=${button.find('span').eq(0).css('color')} (after)`);
+    }
+    inMultipleQueries(){
+        var result= (this.queries&&this.queries.length>1);
+        return result;
+    }
+    isInQuery(queryKey){
+        return (this.queries.indexOf(queryKey)>=0);
+    }
+    recordQuery(queryKey){
+        if(!this.isInQuery(queryKey)) this.queries.push(queryKey);
+    }
+}
+class Query extends Atomic{
+    asins;
+    constructor(key,obj=null){
+        super(key);
+        if (obj) Object.assign(this, obj);
+    }
+    hasASIN(asin){
+        if (!this.asins) this.asins=[];
+        return (this.asins.indexOf(asin)>=0);
+    }
+    recordASIN(asin){
+        if(!this.hasASIN(asin)){
+            this.asins.push(asin);
+        }
+    }
+    get key(){
+        if (this.key){
+            return this.key;
+        } else {
+            return `${this.type}|${this.alias}`;
+        }
+    }
+    get type(){
+        if (this.key){
+            return this.key.split('|')[0];
+        } else {
+            return this.type;
+        }
+    }
+    get value(){
+        if (this.key){
+            return this.key.split('|')[1];
+        } else {
+            return this.alias;
+        }
+    }
+    get alias(){
+        if(this.type==='queue'){
+            var value=this.value
+            return StorageHelper.validQueues.find(function(queue){return queue.value===value;});
+        }else{
+            return this.value;
+        }
+    }
+}
+class Util{
+    static log(key,msg){
+        var hideLogsForKeys=['product'];
+        if (hideLogsForKeys.indexOf(key)==-1) console.log(msg);
+    }
+    static spinnerStart(){
+        $('#overlay').css('display','block');
+    }
+    static spinnerStop(){
+        $('#overlay').css('display','none');
+    }
+    static accordionDisplay(show){
+        if (show){
+            $('#accordionVineAssistant').css('display','block');
+        }else{
+            $('#accordionVineAssistant').css('display','none');
+        }
+    }
+    static clearStorage(){
+        var currentQueryKey = StorageHelper.currentQueryKey;
+        var queryStorage = new QueryStorage(currentQueryKey);
+        var currentQuery = queryStorage.getItem(currentQueryKey);
+        var cleared = false;
+        if (window.confirm(`Press OK to clear local ASIN storage for ALL queues.`))
+        {
+            StorageHelper.initAll();
+            cleared=true;
+        }
+        if (cleared) Util.refreshPage();
+    }
+    static setupFilterIndicator(){
+
+        var gridContainer = $('#vvp-items-grid-container');
+        var gridAnnounce=gridContainer.children('p').first();
+        gridAnnounce.append(` <span id='qs-filter-indicator' class='qs-filter badge rounded-pill text-bg-info'>FILTERED</span>`);
+    }
+    static addStyles(){
+        this.appendStyleSheetLink("https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/css/bootstrap.min.css");
+        this.appendStyleSheetLink("https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@5.15.1/css/all.min.css");
+        this.appendStyleSheetLink("https://code.jquery.com/ui/1.12.1/themes/base/jquery-ui.css");
+        $('head').prepend(`<style type="text/css">
+                     .qs-item-visited span.keywordMatch
+                     {
+                          border:2px solid red;
+                     }
+                     .qs-keyword-match
+                     {
+                        background-color:#0dcaf0;
+                     }
+                     #headingVA .accordion-button
+                     {
+                         background-color:#009900;
+                         color:white;
+                         height:40px;
+                     }
+                     #accordionVineAssistant
+                     {
+                          margin-top:20px;
+                          width:90%;
+                          margin-left:5%;
+                          display:none;
+                     }
+                     #accordionVineAssistant #collapseOne
+                     {
+                         background-color:#FF9900;
+                     }
+                     .hideRadios
+                     {
+                         float:left;
+                     }
+                     .form-check-label
+                     {
+                        margin-right:100px;
+                     }
+                     .keyWordCloud
+                     {
+                          margin-bottom:5px;
+                     }
+                     .keyWordCloud button
+                     {
+                          margin:5px;
+                          font-size:14px;
+                     }
+                     .floatright
+                     {
+                         float:right;
+                     }
+                     .overlay {
+                          background-color:#EFEFEF;
+                          position: fixed;
+                          width: 100%;
+                          height: 100%;
+                          z-index: 1000;
+                          top: 0px;
+                          left: 0px;
+                          opacity: .5;
+                          filter: alpha(opacity=50);
+                          display: block;
+                     }
+                     .spinner-container {
+                        position: absolute;
+                        top: 50%;
+                        left: 50%;
+                        transform: translate(-50%, -50%);
+                        z-index: 20;
+                     }
+                     .popover
+                     {
+                         max-width:400px !important;
+                     }
+                     </style>`);
+    }
+    static getKeyWordList(){
+        return GM_getValue('qs-keywords')||[];
+    }
+    static addKeyWord(keyword){
+        var keyWordList = Util.getKeyWordList();
+        keyword=keyword.toLowerCase();
+        if(keyWordList.indexOf(keyword)>=0){
+            window.alert(`Keyword \'${keyword}\' is already in the list`);
+            return;
+        }
+
+        keyWordList.push(keyword);
+        keyWordList=keyWordList.sort();
+        GM_setValue('qs-keywords',keyWordList);
+    }
+    static removeKeyWord(keyword){
+        //keyCode 17 = CtrlKey
+        if(!Util.isKeyDown(17)){
+            window.alert('To delete a keyword, hold down CTRL and click on a keyword.');
+            return false;
+        }
+        keyword=keyword.toLowerCase();
+        var keyWordList = Util.getKeyWordList();
+        var find=keyWordList.indexOf(keyword);
+        if (find<0) return false;
+        keyWordList.splice(find,1);
+        keyWordList=keyWordList.sort();
+        GM_setValue('qs-keywords',keyWordList);
+        return true;
+    }
+    static getHideVistedConfig(){
+        return GM_getValue('qs-hide-visited');
+    }
+    static setHideVisitedConfig(value){
+        GM_setValue('qs-hide-visited',value||false);
+    }
+    static getHideKeyWordMatchedConfig(){
+        return GM_getValue('qs-hide-keyword-matched');
+    }
+    static setHideKeyWordMatchedConfig(value){
+        GM_setValue('qs-hide-keyword-matched',value||false);
+    }
+    static setupConfigUI(){
+        /*KEYWORDS*/
+        var keywords=Util.getKeyWordList();
+        /*CONFIG*/
+        var hideVisited=Util.getHideVistedConfig()?'checked=checked':'';
+        var hideKeyWordMatched=Util.getHideKeyWordMatchedConfig()?'checked=checked':'';
+
+        $('.vvp-items-button-and-search-container').after(`
+        <div class="accordion" id="accordionVineAssistant">
+          <div class="accordion-item">
+            <h2 class="accordion-header" id="headingVA">
+              <button class="accordion-button" type="button" data-bs-toggle="collapse" data-bs-target="#collapseOne" aria-expanded="true" aria-controls="collapseOne">
+                  <span style="width:200px;">Amazin' Vine Assistant</span>
+                  <span class="floatright" style="width:100%;padding-right:10px;">
+                    <a target=_blank href="https://www.buymeacoffee.com/qwickset"><img style="float:right;height:auto;width:auto;max-height:30px;display:block;" src="https://img.buymeacoffee.com/button-api/?text=Buy me a coffee&emoji=&slug=qwickset&button_colour=FFDD00&font_colour=000000&font_family=Cookie&outline_colour=000000&coffee_colour=ffffff" /></a
+                  </span>
+              </button>
+            </h2>
+            <div id="collapseOne" class="accordion-collapse collapse" aria-labelledby="headingVA" data-bs-parent="#accordionVineAssistant">
+              <div class="accordion-body" id="accordionBodyVineAssistant">
+                <div class="form-check form-switch hideRadios">
+                    <label class="form-check-label" for="switchHideVisited"><input class="form-check-input" type="checkbox" role="switch" id="switchHideVisited" ${hideVisited} />Hide Visited Products</label></label><br/>
+                    <label class="form-check-label" for="switchHideKeyWordMatched"><input class="form-check-input" type="checkbox" role="switch" id="switchHideKeyWordMatched" ${hideKeyWordMatched} />Hide Keyword-Matched Products</label><br/>
+                </div>
+                <div class=qs-keywords>
+                    <form>
+                        <label style="font-weight:bold">Keywords:</label>
+                        <input type="text" id="newkeyword"></input>
+                        <button type="submit" id="qs-keyword-update" class="btn btn-primary">Add</button>
+                        <span class="keyWordCloud" id="keyWordCloud"></span>
+                        <br/>
+                        <small id="keyWordGuide"></small>
+                        <div class="floatright">
+                            <button type="button" class="btn btn-danger" id="qs-clearstorage">Clear Storage</button>
+                        </div>
+                    </form>
+                </div>
+              </div>
+              <div style="padding:10px;">
+                  <sub><i><b>Amazin' Vine Assistant (AVA)</b></i> by Qwickset</sub>
+              </div>
+            </div>
+          </div>
+        </div>
+        `);
+        $('#vvp-items-grid-container').prepend(`
+          <div id="overlay" class="overlay" style="display:block;">
+            <div class="spinner-container">
+                <img width="200px" src="https://icons8.com/preloaders/preloaders/220/Fading%20lines.gif"/>
+            </div>
+          </div>
+        `);
+
+        Util.spinnerStart();
+    }
+    static processHideVisited(getFromConfig){
+        var hide;
+        Util.log('util',`processHideVisited${getFromConfig}`);
+        if (getFromConfig){
+            hide=Util.getHideVistedConfig();
+            $('#switchHideVisited').prop('checked',(hide?'checked':''));
+        }else{
+            hide = $('#switchHideVisited').prop('checked');
+        }
+        Util.log('util',`processHideVisited = ${hide}`);
+        Util.setHideVisitedConfig(hide);
+        Util.toggleItemsBySelector('#switchHideVisited',hide)
+    }
+    static processHideKeyWordMatched(getFromConfig){
+        var hide;
+        if(getFromConfig){
+            hide = Util.getHideKeyWordMatchedConfig();
+            $('#switchHideKeyWordMatched').prop('checked',(hide?'checked':''));
+        }else{
+            hide = $('#switchHideKeyWordMatched').prop('checked');
+        }
+        Util.setHideKeyWordMatchedConfig(hide);
+        Util.toggleItemsBySelector('#switchHideKeyWordMatched',hide)
+    }
+/* FIX THE NEED FOR THIS */
+    static addKeywordMatchStyleToASIN(asin){
+        $('head').prepend(`<style type="text/css">
+        [data-recommendation-id*='${asin}']
+        {
+        background:cyan !important;
+        }`);
+    }
+    static enablePopoverImages(){
+        $('img[rel=popover]').popover({
+            html: true,
+            trigger: 'hover',
+            placement: 'left',
+            container: 'body',
+            content: function(){return '<img src="'+$(this).attr('data-src') + '" />';}
+        });
+    }
+    static enableTooltips(){
+        $('[data-toggle="tooltip"]').tooltip();
+    };
+    static appendStyleSheetLink(href){
+        var link = window.document.createElement('link');
+        link.rel = 'stylesheet';
+        link.type = 'text/css';
+        link.href = href;
+        document.getElementsByTagName("HEAD")[0].appendChild(link);
+    };
+    static hideVisitedItems(selector){
+        $('html').addClass('qs-hide');
+        $('.qs-item-visited:not(.qs-keyword-match)').css('display','none');
+        $('.qs-item-visited .qs-keyword-match').css('display','');
+        $('.qs-filter').css('display','');
+    }
+    static showVisitedItems(selector){
+        $('html').removeClass('qs-hide');
+        $('.qs-item-visited').css('display','');
+        $('.qs-filter').css('display','none');
+    }
+    static processHiddenItems(){
+        var hideVisited = $('#switchHideVisited').prop('checked');
+        var hideKeyWordMatches = $('#switchHideKeyWordMatched').prop('checked');
+        $('.qs-item-visited:not(.qs-keyword-match)').css('display',(hideVisited?'none':''));
+        $('.qs-keyword-match').css('display',(hideKeyWordMatches?'none':''));
+        $('.qs-filter').css('display',(hideVisited||hideKeyWordMatches?'':'none'));
+    }
+    static toggleItemsBySelector(selector,hide){
+        if (hide===undefined){
+            hide = $(selector).prop('checked',!($(selector).prop('checked')));
+        }
+        //var hidden=$('html').hasClass('qs-hide');
+        Util.processHiddenItems();
+    };
+
+    static setTitle(query){
+        var title=$(document).attr("title");
+        var value=query.alias;
+        if (title&&title[0]!=="!"){
+            $(document).attr("title",`AZV ${query.type}:${query.value}`);
+        }
+    }
+    static getTargetParent(element){
+        return element.parent('span').parent('span.vvp-details-btn').first();
+    }
+    static getItemTile(element){
+        return element.parent('div.vvp-item-tile-content').parent('div.vvp-item-tile').first();
+    }
+    static renderKeyWordCloud(){
+        $('#keyWordCloud').html('');
+        $('#keyWordGuide').html('');
+        var keywordList=Util.getKeyWordList();
+        if (!keywordList||keywordList.length===0) return;
+        $('#keyWordGuide').html('Hold CTRL key and click on keyword to remove');
+        keywordList.forEach(x=>{
+            $('#keyWordCloud').append(`<button type="button" class="keyword btn btn-info btn-xs rounded-pill">${x}</button>`);
+        });
+    }
+    static keyWordMatches(text){
+        var keywordList=this.getKeyWordList();
+        if (!keywordList) return;
+        var keywordMatches=[];
+        var matchFound=false;
+        keywordList.forEach(x=>{
+            if (text.toLowerCase().indexOf(x.toLowerCase())>=0 && keywordMatches.indexOf(x.toLowerCase())<0)
+            {
+                keywordMatches.push(x.toLowerCase());
+            }
+        });
+        return keywordMatches;
+    }
+    static refreshPage(){
+        location.reload(true);
+    }
+    static getFullSizeImageSrc(imgSrc){
+        var pos1 = imgSrc.lastIndexOf('._');
+        var pos2 = imgSrc.lastIndexOf('_.')+2;
+        var replace= imgSrc.substring(pos1,pos2).replace('/_','///_');;
+        return imgSrc.replace(replace,'.');
+    }
+    static processPage(firstLoad){
+        var currentStorage=new QueryStorage(StorageHelper.currentQueryKey);
+        $('.a-button-input').click(function(){
+            var itemHeroImg = $('#vvp-product-details-modal--hero-image').first();
+            itemHeroImg.popover('dispose');
+            setTimeout(function(){
+                var itemHeroImg = $('#vvp-product-details-modal--hero-image').first();
+                //itemHeroImg.popover('dispose');
+                //itemHeroImg.removeAttr('rel');
+                //itemHeroImg.removeAttr('data-src');
+                itemHeroImg.attr('rel','popover');
+                itemHeroImg.attr('data-src',Util.getFullSizeImageSrc(itemHeroImg.attr('src')));
+                Util.enablePopoverImages();
+            }, 750);
+        });
+
+        $("[id^='a-autoid'] > span > input").each(function(index){
+            var element=$(this);
+            if(element.data('asin') !== 'undefined')
+            {
+                var ASIN=element.data('asin');
+                if (ASIN)
+                {
+                    var product = product=StorageHelper.getProduct(ASIN);
+                    if (!product){
+                        product=StorageHelper.recordProduct(ASIN);
+                    }
+                    var parent = Util.getTargetParent(element);
+                    var itemTile = Util.getItemTile(parent);
+                    var itemImg = itemTile.find('img').first();
+                    var itemLink = itemTile.find('a.a-link-normal');
+                    var fullDescription=itemTile.find('span.a-truncate-full');
+                    var keyWordMatches= Util.keyWordMatches(fullDescription.text());
+                    var itemButton = itemTile.find('span.a-button-text');
+                    itemTile.removeClass('qs-keyword-match');
+                    itemTile.removeAttr('title');
+                    itemTile.removeAttr('data-toggle');
+                    itemImg.attr('rel','popover');
+                    itemImg.attr('data-src',Util.getFullSizeImageSrc(itemImg.attr('src')));
+                    if (!product.isNew || product.inMultipleQueries())
+                    {
+                        itemTile.addClass('qs-item-visited');
+                    }
+                    if (keyWordMatches&&keyWordMatches.length>0){
+                        //Util.addKeywordMatchStyleToASIN(ASIN);
+                        itemTile.addClass('qs-keyword-match');
+                        itemTile.attr('data-toggle','tooltip');
+                        itemTile.attr('title',`Keywords Matched:\n\n- ${keyWordMatches.join('\n- ')}`);
+                    }
+                    //if (!keyWordMatches || keyWordMatches.length<=0){
+                    //    itemTile.css('display','none');
+                    //}
+                    if (itemButton)
+                    {
+                        itemButton.text(product.getButtonText());
+                        if (product.inMultipleQueries()) itemButton.addClass('inMultipleQueries');
+                        else if (!product.isNew) itemButton.addClass('recordedASIN');
+                    }
+                }
+            }
+        });
+    }
+    static setupListeners(){
+        document.addEventListener('keydown', function(event) {
+            //Util.log('general',`keydown = ${event.keyCode}`);
+          keyState[event.keyCode] = true;
+        });
+
+        document.addEventListener('keyup', function(event) {
+          keyState[event.keyCode] = false;
+        });
+
+        $('button#qs-clearstorage').click(function(){
+            if ( event.ctrlKey && event.altKey && event.shiftKey) {
+                Util.clearStorage();
+            }else{
+                window.alert('To clear storage, hold down CTRL+SHIFT+ALT and click \'Clear Storage\'\n\n******WARNING******\nThis will clear all of Vine Assistant\'s visited items history.');
+            }
+        });
+        $('button#qs-keyword-update').click(function(){
+            Util.spinnerStart();
+            var newKeyWord = $('#newkeyword').val();
+            if(!newKeyWord) return;
+            Util.addKeyWord(newKeyWord);
+            $('#newkeyword').val('');
+            Util.processPage(false);
+            Util.renderKeyWordCloud();
+            Util.spinnerStop();
+            return false;
+        });
+        $(document).on('click','button.keyword',function(){
+            var keyword=$(this).html();
+            if (!Util.removeKeyWord(keyword)) return;
+            Util.processPage(false);
+            Util.renderKeyWordCloud();
+            Util.spinnerStop();
+        });
+        $('#switchHideVisited').change(function(){
+            Util.processHideVisited();
+        });
+        $('#switchHideKeyWordMatched').change(function(){
+            Util.processHideKeyWordMatched();
+        });
+
+    }
+    static isKeyDown(keyCode){
+        return keyState[keyCode] === true;
+    }
+    static getContrastYIQ(color){
+        let hexcolor=color;
+        if (color.indexOf('rgb(')>=0){
+            hexcolor=Util.rgb2hex(color);
+        }
+        hexcolor = hexcolor.replace("#", "");
+        var r = parseInt(hexcolor.substr(0,2),16);
+        var g = parseInt(hexcolor.substr(2,2),16);
+        var b = parseInt(hexcolor.substr(4,2),16);
+        var yiq = ((r*299)+(g*587)+(b*114))/1000;
+        const foregroundColor= (yiq >= 128) ? '#000' : '#fff';
+        Util.log('util',`getContrastYIQ('${hexcolor}')='${foregroundColor}'`);
+        return foregroundColor;
+    }
+    static rgb2hex(rgb) {
+      if (/^#[0-9A-F]{6}$/i.test(rgb)) {
+        return rgb;
+      }
+
+      rgb = rgb.match(/^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/);
+
+      function hex(x) {
+        return ("0" + parseInt(x).toString(16)).slice(-2);
+      }
+
+      return "#" + hex(rgb[1]) + hex(rgb[2]) + hex(rgb[3]);
+    }
+    static getQueryString(parm) {
+        var assoc = {};
+        var decode = function (s) { return decodeURIComponent(s.replace(/\+/g, " ")); };
+        var queryString = location.search.substring(1);
+        var keyValues = queryString.split('&');
+
+        for(var i in keyValues) {
+            var key = keyValues[i].split('=');
+            if (key.length > 1) {
+                assoc[decode(key[0])] = decode(key[1]);
+            }
+        }
+        if (parm){
+            return assoc[parm];
+        }else{
+            return assoc;
+        }
+    }
+}
+function main(){
+    'use strict';
+    $(document).ready(function()
+    {
+        if(!Util.getQueryString("AVA") || Util.getQueryString("redirectFromSmile")!=="1")
+        {
+            Util.addStyles();
+            Util.setupConfigUI();
+            Util.spinnerStart();
+            Util.setupListeners();
+            setTimeout(function(){
+                Util.setupFilterIndicator();
+                Util.enableTooltips();
+                Util.processPage(true);
+                Util.enablePopoverImages();
+                Util.setTitle(StorageHelper.currentQueryKey);
+                Util.processHideVisited(true);
+                Util.processHideKeyWordMatched(true);
+                Util.renderKeyWordCloud();
+                Util.spinnerStop();
+                Util.accordionDisplay(true);
+            }, 1);
+        }
+    });
+}
+var keyState=[];
+
+main();
