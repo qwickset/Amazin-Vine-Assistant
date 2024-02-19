@@ -1,4 +1,4 @@
-# Amazin-Vine-Assistant
+# Amazin-Vyne-Assistant
 AMZV Tampermonkey script
 
 Features:
